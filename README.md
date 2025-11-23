@@ -14,8 +14,8 @@ A self-healing code generation system that leverages LangGraph to create an agen
 1. Clone the repository:
 
    ```bash
-   git clone https://github.com/yourusername/self-healing-code-agent.git
-   cd self-healing-code-agent
+   git clone https://github.com/Yuvraj3905/Self-Healing-Code-Agent
+   cd Self-Healing-Code-Agent
    ```
 
 2. Install the required dependencies:
