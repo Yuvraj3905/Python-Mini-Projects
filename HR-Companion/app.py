@@ -4,11 +4,9 @@ import streamlit as st
 from dotenv import load_dotenv
 from typing import List
 from supabase import create_client, Client
-# UPDATED: Use pypdf instead of PyPDF2
 from pypdf import PdfReader
 
 # LangChain Imports
-# UPDATED: Explicit import to prevent circular dependency errors
 import sentence_transformers 
 from langchain_groq import ChatGroq
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -24,7 +22,6 @@ st.set_page_config(page_title="TalentScout AI", layout="wide")
 url = os.environ.get("SUPABASE_URL")
 key = os.environ.get("SUPABASE_KEY")
 
-# Graceful error handling if keys are missing
 if not url or not key:
     st.error("Supabase credentials not found. Please set SUPABASE_URL and SUPABASE_KEY in your .env file.")
     st.stop()
@@ -32,17 +29,14 @@ if not url or not key:
 supabase: Client = create_client(url, key)
 
 # Initialize Models with Caching
-# UPDATED: Wrapped in st.cache_resource to prevent reload loops and import errors
 @st.cache_resource
 def load_models():
-    # Ensure GROQ_API_KEY is in .env
     if not os.environ.get("GROQ_API_KEY"):
         st.error("Groq API Key not found. Please set GROQ_API_KEY in your .env file.")
         st.stop()
 
     llm_instance = ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0)
     
-    # UPDATED: Force 'cpu' to prevent meta tensor errors
     embeddings_instance = HuggingFaceEmbeddings(
         model_name="all-MiniLM-L6-v2",
         model_kwargs={'device': 'cpu'}
@@ -62,7 +56,6 @@ class CandidateProfile(BaseModel):
 # --- HELPER FUNCTIONS ---
 
 def extract_text_from_pdf(uploaded_file):
-    # UPDATED: PdfReader from pypdf works identically
     reader = PdfReader(uploaded_file)
     text = ""
     for page in reader.pages:
@@ -79,7 +72,7 @@ def parse_resume_to_json(text):
     )
     chain = prompt | llm | parser
     try:
-        return chain.invoke({"text": text[:4000]}) # Limit text to avoid context window issues
+        return chain.invoke({"text": text[:4000]}) 
     except Exception as e:
         st.error(f"Error parsing resume: {e}")
         return None
@@ -103,7 +96,8 @@ def ingest_resume(file):
         "email": profile['email'],
         "years_of_experience": profile['years_of_experience'],
         "skills": profile['skills'],
-        "content": text, # Store full text for RAG
+        "summary": profile['summary'], # UPDATED: Now saving the summary!
+        "content": text, 
         "embedding": vector
     }
     
@@ -114,18 +108,26 @@ def ingest_resume(file):
         st.error(f"Database Error: {e}")
         return None
 
+def fetch_all_candidates():
+    """Fetches all candidates for display in the UI"""
+    try:
+        # UPDATED: Select summary as well
+        response = supabase.table("candidates").select("name, email, years_of_experience, skills, summary").execute()
+        return response.data
+    except Exception as e:
+        st.error(f"Error fetching candidates: {e}")
+        return []
+
 def rank_candidates(job_description):
     """Semantic Search against the Job Description"""
-    # 1. Embed the JD
     query_vector = embeddings.embed_query(job_description)
     
-    # 2. Call Supabase RPC function (Vector Search)
     try:
         response = supabase.rpc(
             "match_candidates", 
             {
                 "query_embedding": query_vector,
-                "match_threshold": 0.5, # Minimum similarity
+                "match_threshold": 0.5, 
                 "match_count": 5
             }
         ).execute()
@@ -152,34 +154,58 @@ def generate_hr_report(candidate, job_description):
 
 def chat_with_db(query):
     """
-    Advanced RAG: Decides whether to do SQL filter or Vector Search.
-    For this demo, we will do a simple logic: 
-    If query mentions numbers (e.g. '2 years'), we fetch all and filter in Python (easier for demo).
-    Otherwise, we do vector search.
+    Advanced RAG: Hybrid approach using SQL for listing/filtering and Vector for semantic search.
     """
-    # Simple "Self-Query" Logic simulation
-    # In a full production app, you would use an LLM Router chain here
-    if "year" in query.lower() and any(char.isdigit() for char in query):
-        # SQL Filter path (Logic: Get all candidates, filter in Python for simplicity)
+    query_lower = query.lower()
+    
+    # 1. DIRECT DATABASE LOOKUP 
+    if any(k in query_lower for k in ["list", "names", "show", "all candidates", "who are", "candidates we have"]):
         try:
-            data = supabase.table("candidates").select("*").execute().data
+            data = supabase.table("candidates").select("name, years_of_experience, skills, summary").limit(20).execute().data
             
-            # Pass data to LLM to answer the question
+            if not data:
+                return "The database is currently empty. Please upload some resumes first."
+            
+            # Helper to safely get summary
+            def get_summary(c):
+                return c.get('summary', 'No summary available') or 'No summary available'
+                
+            context = "\n".join([f"- {c['name']} ({c['years_of_experience']} yrs): {c['skills']} | Summary: {get_summary(c)}" for c in data])
+            prompt = f"User Query: {query}\n\nDatabase Content (All Candidates):\n{context}\n\nAnswer the user based on the database content:"
+            return llm.invoke(prompt).content
+        except Exception as e:
+            return f"Database Error: {e}"
+
+    # 2. SQL FILTERING 
+    elif "year" in query_lower and any(char.isdigit() for char in query):
+        try:
+            data = supabase.table("candidates").select("name, years_of_experience, skills").execute().data
+            
             context = "\n".join([f"Name: {c['name']}, Exp: {c['years_of_experience']} years, Skills: {c['skills']}" for c in data])
             prompt = f"User Query: {query}\n\nCandidate Data:\n{context}\n\nAnswer the user based on the data:"
             return llm.invoke(prompt).content
         except Exception as e:
-            return f"Error querying database: {e}"
+            return f"Database Error: {e}"
+
+    # 3. VECTOR SEARCH 
     else:
-        # Vector Search path
         query_vector = embeddings.embed_query(query)
         try:
-            data = supabase.rpc("match_candidates", {"query_embedding": query_vector, "match_threshold": 0.5, "match_count": 3}).execute().data
-            context = "\n".join([f"Name: {c['name']}, Summary: {c['content'][:500]}..." for c in data])
-            prompt = f"User Query: {query}\n\nRelevant Resumes:\n{context}\n\nAnswer the user:"
+            response = supabase.rpc("match_candidates", {"query_embedding": query_vector, "match_threshold": 0.4, "match_count": 5}).execute()
+            data = response.data
+            
+            # FALLBACK
+            if not data:
+                 # UPDATED: Select summary safely
+                 data = supabase.table("candidates").select("name, skills, summary").limit(5).execute().data
+                 context = "No direct semantic matches found. Here are some random candidates from the DB:\n" + "\n".join([f"- {c['name']}: {c['skills']}" for c in data])
+            else:
+                 context = "\n".join([f"Name: {c['name']}, Summary: {c.get('summary', 'No summary')}..." for c in data])
+            
+            prompt = f"User Query: {query}\n\nRelevant Context:\n{context}\n\nAnswer the user:"
             return llm.invoke(prompt).content
         except Exception as e:
-            return f"Error with vector search: {e}"
+            return f"Vector Search Error: {e}"
 
 # --- UI LAYOUT ---
 
@@ -188,22 +214,34 @@ st.markdown("Automated Resume Screening with **Structured Extraction** & **Hybri
 
 tabs = st.tabs(["📤 Upload Resumes", "📊 Rank & Screen", "💬 HR Assistant"])
 
-# TAB 1: UPLOAD
+# TAB 1: UPLOAD & VIEW
 with tabs[0]:
-    st.header("Ingest Candidates")
-    uploaded_files = st.file_uploader("Upload PDF Resumes", type=["pdf"], accept_multiple_files=True)
+    col1, col2 = st.columns([1, 1])
     
-    if st.button("Process Resumes"):
-        if not uploaded_files:
-            st.warning("Please upload files first.")
+    with col1:
+        st.header("Ingest Candidates")
+        uploaded_files = st.file_uploader("Upload PDF Resumes", type=["pdf"], accept_multiple_files=True)
+        
+        if st.button("Process Resumes"):
+            if not uploaded_files:
+                st.warning("Please upload files first.")
+            else:
+                progress_bar = st.progress(0)
+                for i, file in enumerate(uploaded_files):
+                    name = ingest_resume(file)
+                    if name:
+                        st.success(f"Ingested: {name}")
+                    progress_bar.progress((i + 1) / len(uploaded_files))
+                st.success("Processing Complete!")
+                st.rerun() 
+
+    with col2:
+        st.header("Current Talent Pool")
+        existing_candidates = fetch_all_candidates()
+        if existing_candidates:
+            st.dataframe(existing_candidates)
         else:
-            progress_bar = st.progress(0)
-            for i, file in enumerate(uploaded_files):
-                name = ingest_resume(file)
-                if name:
-                    st.success(f"Ingested: {name}")
-                progress_bar.progress((i + 1) / len(uploaded_files))
-            st.success("Processing Complete!")
+            st.info("No candidates in database yet.")
 
 # TAB 2: RANKING
 with tabs[1]:
@@ -230,13 +268,25 @@ with tabs[1]:
                             report = generate_hr_report(candidate, jd)
                             st.markdown(f"**AI Assessment:**\n{report}")
 
-# TAB 3: CHATBOT
+# TAB 3: HR ASSISTANT
 with tabs[2]:
     st.header("Ask questions about your talent pool")
     st.info("Try asking: 'Who has more than 5 years of experience?' or 'Do we have any React developers?'")
     
-    user_query = st.text_input("Ask the AI Recruiter:")
-    if st.button("Ask"):
-        with st.spinner("Thinking..."):
-            answer = chat_with_db(user_query)
-            st.markdown(f"**Answer:** {answer}")
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if prompt := st.chat_input("Ask the AI Recruiter..."):
+        st.chat_message("user").markdown(prompt)
+        st.session_state.messages.append({"role": "user", "content": prompt})
+
+        with st.spinner("Analyzing talent pool..."):
+            response = chat_with_db(prompt)
+
+        with st.chat_message("assistant"):
+            st.markdown(response)
+        st.session_state.messages.append({"role": "assistant", "content": response})
