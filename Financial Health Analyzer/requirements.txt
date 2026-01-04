@@ -1,0 +1,5 @@
+streamlit
+pandas
+pdfplumber
+plotly
+langchain_community
